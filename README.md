@@ -1,4 +1,4 @@
-# CSE416 PODO BACKEND BY TEAM ONE-EGO
+# CSE542 STREAMING DP Project
 ## Installation
 
 - Please follow the instructions below if you installed back-end repo for the first time.
@@ -46,5 +46,4 @@ python3 server.py
 
 - We are using Fast API Framework for our back-end
 - you can check and test all the available apis at http://localhost:4000/docs
-- Please pull backend repo daily as I will frequently update the codes.
-- Please DO NOT CHANGE ANY CODE and PUSH TO THE MASTER without my permission.
+- Please DO NOT CHANGE ANY CODE and PUSH TO THE MAIN without my permission.
