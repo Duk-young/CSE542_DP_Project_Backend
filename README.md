@@ -44,6 +44,5 @@ python3 server.py
 ```
 ## For your information
 
-- We are using Fast API Framework for our back-end
-- you can check and test all the available apis at http://localhost:4000/docs
-- Please DO NOT CHANGE ANY CODE and PUSH TO THE MAIN without my permission.
+This Backend server requires Reddit API Key to be set in .env file.
+Please contact dukyoung.eom@stonybrook.edu for detailed instruction to run the server in local.
