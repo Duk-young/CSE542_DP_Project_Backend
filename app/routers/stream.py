@@ -9,7 +9,6 @@ from fastapi import (
     Form,
 )
 from fastapi.responses import StreamingResponse
-from ..models import test_model
 import asyncpraw
 import pandas as pd
 import datetime
@@ -21,10 +20,21 @@ import signal
 import preprocessor as p
 import nltk
 from nltk.corpus import stopwords
+from nltk.tokenize import word_tokenize
+from nltk.stem import WordNetLemmatizer
+from nltk.tag import pos_tag
 import csv
 import json
 from diffprivlib.mechanisms import Laplace
 from pydantic import BaseModel
+import numpy as np
+import random
+import string
+import copy
+from scipy.stats import laplace
+import pydp as dp 
+from pydp.algorithms.laplacian import BoundedSum, Count
+import math
 # /test to reach APIs
 router = APIRouter(
     prefix="/stream",
@@ -34,17 +44,60 @@ router = APIRouter(
         403: {"description": "Operation forbidden"},
     },
 )
+stop_words = set(stopwords.words('english'))
+stop_words = [x.lower() for x in stop_words]
 
 class SentimentData(BaseModel):
     sentiment_score: dict
     epsilon: float
     sensitivity_score: float
 
+class PrivacyLossRequest(BaseModel):
+    dataset: list
+    epsilon: float
+
 def add_ibm_laplacian_noise(data, epsilon, sensitivity):
     laplace_mech = Laplace(epsilon=epsilon, sensitivity=sensitivity)
     return laplace_mech.randomise(data)
-    
-# clean up text process
+
+def truncated_laplace_noise(sentiment_scores, epsilon, sensitivity, lower_bound=-1, upper_bound=1):
+    # Scale for the Laplace distribution
+    scale = sensitivity / epsilon
+    # Calculate truncation points based on the current data point
+    noisy_data = np.zeros_like(sentiment_scores)
+    # Drawing noise from the truncated Laplace distribution
+    for i in range(len(sentiment_scores)):
+        val = sentiment_scores[i]
+        while True:
+            noise = np.random.laplace(0, scale)
+            noisy_val = val + noise
+            # noisy_val = add_ibm_laplacian_noise(val,epsilon,sensitivity)
+            # print("noisy_val:",noisy_val)
+            if lower_bound <= noisy_val <= upper_bound:
+                    noisy_data[i] = noisy_val
+                    break
+    return noisy_data
+
+def privacy_loss(data1, data2, mechanism, epsilon, sensitivity = 1, num_samples=100):
+    """Computes privacy loss for two neighboring datasets."""
+    privacy_losses = []
+
+    for _ in range(num_samples):
+        output1 = mechanism(sentiment_scores=data1, epsilon=epsilon, sensitivity=sensitivity)
+        output2 = mechanism(sentiment_scores=data2, epsilon=epsilon, sensitivity=sensitivity)
+        scale = 1 / epsilon
+        loc = 0
+
+        prob_dist_data1 = laplace.pdf(output1, loc=loc, scale=scale)
+        prob_dist_data2 = laplace.pdf(output2, loc=loc, scale=scale)
+
+        for o1, o2 in zip(prob_dist_data1, prob_dist_data2):
+            if o2 > 0:
+                p_loss = np.log(o1 / o2)
+                privacy_losses.append(p_loss)
+    return sorted(privacy_losses, reverse=True)
+
+# clean up text process for sentiment analysis
 def preprocess_texts(text):
     result = []
 
@@ -56,6 +109,43 @@ def preprocess_texts(text):
     result = intmd_result
 
     return result
+
+# clean up text process for wordcloud
+def preprocess_wordcloud(text):
+    result = ""
+    # convert all text to lower case
+    text = text.lower()
+
+    # preprocess texts. removes URLs, mentions, hashtags, digist, and emojis (and smileys)
+    p.set_options(p.OPT.URL, p.OPT.MENTION, p.OPT.HASHTAG, p.OPT.NUMBER, p.OPT.EMOJI, p.OPT.SMILEY)
+    intmd_result = p.clean(text)
+    # remove possible HTML tag leftovers
+    intmd_result = intmd_result.replace("&amp", "").replace("\n", "")
+
+    
+    # remove all the punctuations from text
+    remove_punctuations = str.maketrans('','', string.punctuation)
+    intmd_result = intmd_result.translate(remove_punctuations)
+
+    # Initailize Lemmatizer. reduce words to their base form
+    lemmatizer = WordNetLemmatizer()
+    # Remove Stop words ex) a, the, his, her, etc..
+    for word, tag in pos_tag(word_tokenize(intmd_result)):
+
+        # lemmatize first
+        if word not in stop_words: # comment this line if want only lemmatize
+            pos = ''
+            if tag.startswith("NN"):
+                pos = 'n'   
+            elif tag.startswith('VB'):
+                pos = 'v'
+            elif tag.startswith('JJ'):
+                pos = 'a'
+            if pos != '':
+                word = lemmatizer.lemmatize(word, pos)
+            result+=word+","
+    return result
+
 
 def get_date(created):
     return str(datetime.datetime.fromtimestamp(created))
@@ -123,6 +213,23 @@ async def stream_posts(request: Request, community: str = 'israelpalestine'):
     
     async def event_generator():
         global is_streaming_post
+        recent_posts = subreddit.new(limit=100)
+        async for post in recent_posts:
+            sentiment_score = request.app.sia.polarity_scores(preprocess_texts(post.selftext))
+            post_data = json.dumps({
+                'title': post.title,
+                'score': post.score,
+                'id': post.id,
+                'url': post.url,
+                'total_comments': post.num_comments,
+                'created': get_date(post.created),
+                'body': post.selftext,
+                'body_wordcloud': preprocess_wordcloud(post.selftext),
+                'author': str(post.author),
+                'sentiment_score':sentiment_score,
+                'sentiment': 'Positive' if sentiment_score['compound'] > 0 else 'Negative'
+            })
+            yield f"data: {post_data}\n\n"
         is_streaming_post = True
         while is_streaming_post:
             async for post in subreddit.stream.submissions():
@@ -138,6 +245,7 @@ async def stream_posts(request: Request, community: str = 'israelpalestine'):
                     'total_comments': post.num_comments,
                     'created': get_date(post.created),
                     'body': post.selftext,
+                    'body_wordcloud': preprocess_wordcloud(post.selftext),
                     'author': str(post.author),
                     'sentiment_score':sentiment_score,
                     'sentiment': 'Positive' if sentiment_score['compound'] > 0 else 'Negative'
@@ -153,6 +261,24 @@ async def stream_comments(request: Request, community: str = 'israelpalestine'):
 
     async def event_generator():
         global is_streaming_comment
+        # Fetch and process the most recent 500 comments
+        recent_comments = subreddit.comments(limit=500)
+        async for comment in recent_comments:
+            sentiment_score = request.app.sia.polarity_scores(preprocess_texts(comment.body))
+            comment_data = json.dumps({
+                'title':"Comment",
+                'score':comment.score, 
+                'id': comment.id, 
+                'url':"", "total_comments":0, 
+                'author': str(comment.author), 
+                'body': comment.body, 
+                'body_wordcloud': preprocess_wordcloud(comment.body),
+                'created':get_date(comment.created),
+                'sentiment_score':sentiment_score,
+                'sentiment': 'Positive' if sentiment_score['compound'] > 0 else 'Negative'
+            })
+            yield f"data: {comment_data}\n\n"
+
         is_streaming_comment = True
         while is_streaming_comment:
             async for comment in subreddit.stream.comments():
@@ -167,6 +293,7 @@ async def stream_comments(request: Request, community: str = 'israelpalestine'):
                     'url':"", "total_comments":0, 
                     'author': str(comment.author), 
                     'body': comment.body, 
+                    'body_wordcloud': preprocess_wordcloud(comment.body),
                     'created':get_date(comment.created),
                     'sentiment_score':sentiment_score,
                     'sentiment': 'Positive' if sentiment_score['compound'] > 0 else 'Negative'
@@ -177,12 +304,74 @@ async def stream_comments(request: Request, community: str = 'israelpalestine'):
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 
 @router.post("/apply-dp")
-async def apply_dp(request: Request, data: SentimentData):
-    print(data)
-    dp_sentiment_score = {}
-    for key, value in data.sentiment_score.items():
-        dp_sentiment_score[key] = add_ibm_laplacian_noise(value, data.epsilon, data.sensitivity_score)
-    return dp_sentiment_score
+async def apply_dp(request: Request, data:PrivacyLossRequest):
+    dataset = data.dataset  
+    epsilon = data.epsilon
+    dp_applied_output = []
+    for data in dataset:
+        x = Count(epsilon=epsilon)
+        count = x.quick_result(data)  # accepts only list as input
+        dp_applied_output.append(count)
+    replaced_output = [x if x >= 0 else 0 for x in dp_applied_output]
+
+    flat_list = [sum(sublist) for sublist in dataset]
+    original_prob_sum = sum(flat_list)
+    dp_prob_sum = sum(replaced_output)
+    original_prob = [x / original_prob_sum for x in flat_list]
+    dp_prob = [x / dp_prob_sum for x in replaced_output]
+
+    original_prob_array = np.array(original_prob)
+    dp_prob_array = np.array(dp_prob)
+
+    # Compute Total Variation Distance (TVD)
+    tvd = np.sum(np.abs(original_prob_array - dp_prob_array)) / 2
+
+    # Compute Mean Squared Error (MSE)
+    mse = np.mean((original_prob_array - dp_prob_array) ** 2)
+    return {"dp_histogram":replaced_output, "tvd":tvd, "mse":mse}
+
+
+@router.post("/privacy-loss")
+async def privacy_loss_request(request: Request, data:PrivacyLossRequest, attempts: int = 1000):
+    dataset = data.dataset
+    epsilon = data.epsilon
+    flat_dataset = [x for xs in dataset for x in xs]
+    origin_sum = sum(flat_dataset)
+    result = {"inferences":[],"privacy_loss":[], 'infer_member':None, "tps":0}
+    neighboring_dataset = copy.deepcopy(dataset)
+    avg_noise = 0
+    if len(dataset) > 1:
+        while True:
+            index = random.randint(0,len(neighboring_dataset)-1)
+            if len(neighboring_dataset[index]) > 1:
+                result["infer_member"] = neighboring_dataset[index].pop()
+                break
+        flat_neighboring_dataset = [x for xs in neighboring_dataset for x in xs]
+        # print(neighboring_dataset)
+        data1 = [sum(lst) / len(lst) for lst in dataset if lst]
+        data2 = [sum(lst) / len(lst) for lst in neighboring_dataset if lst]
+        data1 = [x + 1 for x in data1]
+        data2 = [x + 1 for x in data2]
+        result["privacy_loss"] = privacy_loss(data1=data1, data2=data2, mechanism = truncated_laplace_noise, epsilon=epsilon, sensitivity=1)
+        print("works until this point")
+        neighboring_sum = sum(flat_neighboring_dataset)
+        for i in range(attempts):
+            # dp_dataset = truncated_laplace_noise(sentiment_scores=flat_neighboring_dataset, epsilon=epsilon, sensitivity=1)
+            # inference = origin_sum - sum(dp_dataset)
+            dp_sum = add_ibm_laplacian_noise(neighboring_sum, epsilon, 1)
+            inference = origin_sum - dp_sum
+            # print("target :", result["infer_member"],"/ inference :",inference)
+            if math.isclose(result['infer_member'], inference, abs_tol=0.01):
+                result["tps"]+=1
+            result["inferences"].append(inference)
+            avg_noise += inference - result['infer_member']
+    avg_noise /= attempts
+    print("Epsilon:",epsilon)
+    print("Target:", result['infer_member'])
+    print("Positive Inferences out of 1000:", result["tps"])
+    print("Average Noise:", f"{avg_noise}")
+    return result
+
 
 @router.post("/stop-posts")
 async def stop_streaming(request: Request):

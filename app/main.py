@@ -9,13 +9,12 @@ from .routers import stream
 import requests
 import json
 import nltk
-from nltk.sentiment import SentimentIntensityAnalyzer
+from nltk.sentiment.vader import SentimentIntensityAnalyzer
 
 # dotenv initialize
 load_dotenv() # Load Environment variables
 
 # env var setups
-DB_ADDRESS = os.getenv("DB_ADDRESS") # Get Environment variable named "DB_ADDRESS"
 OPENAPI_URL = os.getenv("OPENAPI_URL") 
 CLIENT_ID = os.getenv("CLIENT_ID")
 CLIENT_SECRET = os.getenv("CLIENT_SECRET")
